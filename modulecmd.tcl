@@ -66,8 +66,10 @@ if { [isWin] } {
    set g_def_separator ":"
 }
 
-# second level separator, used to serialize conflict info
+# second level separator, used to serialize conflict and prereq info
 set g_def_separator_lvl2 "&"
+# third level separator, used to serialize prereq info
+set g_def_separator_lvl3 "|"
 
 # Dynamic columns
 set DEF_COLUMNS 80 ;# Default size of columns for formatting
@@ -1820,12 +1822,25 @@ proc conflict {args} {
 }
 
 proc prereq {args} {
+   global ModulesCurrentPrereq g_orig_load_control
+
    set mode [currentMode]
    set currentModule [currentModuleName]
 
    reportDebug "prereq: ($args) mode = $mode"
 
    if {$mode eq "load"} {
+      if {$g_orig_load_control == 0} {
+         # build prereq list to register in _LMPREREQ_
+         # after successful module load. sets of optional
+         # prereq are registered as a list
+         if { ![info exists ModulesCurrentPrereq($currentModule)]\
+            || [lsearch -exact $ModulesCurrentPrereq($currentModule) \
+            $args] == -1} {
+            lappend ModulesCurrentPrereq($currentModule) $args
+         }
+      }
+
       if {![is-loaded $args]} {
          set errMsg "WARNING: $currentModule cannot be loaded due to\
              missing prereq."
@@ -2778,6 +2793,7 @@ proc cacheCurrentModules {} {
    global g_loadedModules g_loadedModulesGeneric
    global g_orig_load_control g_def_separator_lvl2 g_lmConflict
    global env g_def_separator
+   global g_def_separator_lvl3 g_lmPrereq
 
    reportDebug "cacheCurrentModules"
 
@@ -2798,6 +2814,21 @@ proc cacheCurrentModules {} {
             # test that conflict module list is correct
             if {[llength $modlist] >= 2} {
                set g_lmConflict([lindex $modlist 0]) [lrange $modlist 1 end]
+            }
+         }
+      }
+
+      # cache declared prereq of loaded modules
+      if {[info exists env(_LMPREREQ_)]} {
+         foreach modprereq [split $env(_LMPREREQ_) $g_def_separator] {
+            set modlist [split $modprereq $g_def_separator_lvl2]
+            # test that prereq module list is correct
+            if {[llength $modlist] >= 2} {
+               set lmprereq {}
+               foreach prereq [lrange $modlist 1 end] {
+                  lappend lmprereq [split $prereq $g_def_separator_lvl3]
+               }
+               set g_lmPrereq([lindex $modlist 0]) $lmprereq
             }
          }
       }
@@ -3687,6 +3718,129 @@ proc getSimplifiedLoadedModuleList {{helper_raw_list {}}\
    return $curr_mod_list
 }
 
+# get list of loaded modules having directly a prereq onto
+# modulename or having a prereq onto dependencies of modulename
+proc getDepLoadedModuleList {modulename {dep_list {}}} {
+   global g_lmPrereq g_debug
+
+   if {$g_debug} {
+      report "DEBUG getDepLoadedModuleList: $modulename"
+   }
+
+   foreach prereqmod [array names g_lmPrereq] {
+      set isprereq 0
+      set imax [llength $g_lmPrereq($prereqmod)]
+      for {set i 0} {$i<$imax && $isprereq==0} {incr i 1} {
+         set withmod [lindex $g_lmPrereq($prereqmod) $i]
+         set jmax [llength $withmod]
+         if {$jmax > 1} {
+            for {set j 0} {$j<$jmax && $isprereq==0} {incr j 1} {
+               set optmod [lindex $withmod $j]
+               if {[string first "$optmod/" "$modulename/"] == 0} {
+                  set isprereq 1
+               }
+            }
+         } elseif {[string first "$withmod/" "$modulename/"] == 0} {
+            set isprereq 1
+         }
+
+         if {$isprereq == 1 && [lsearch -exact $dep_list \
+            $prereqmod] == -1} {
+            # add module with a prereq on modulename to the list
+            lappend dep_list $prereqmod
+            # then add recursively dependencies of this dependent mod
+            set dep_list [getDepLoadedModuleList $prereqmod $dep_list]
+         }
+      }
+   }
+
+   return $dep_list
+}
+
+# get list of loaded modules having a direct
+# and active dependency onto modulename
+proc getActiveDepLoadedModuleList {modulename} {
+   global g_loadedModules g_lmPrereq g_debug
+
+   if {$g_debug} {
+      report "DEBUG getActiveDepLoadedModuleList: $modulename"
+   }
+
+   set dep_list {}
+   set lmlist [array names g_loadedModules]
+   set kmax [llength $lmlist]
+
+   # check if any loaded module has declared a prereq
+   foreach prereqmod [array names g_lmPrereq] {
+      set isprereq 0
+      set imax [llength $g_lmPrereq($prereqmod)]
+      for {set i 0} {$i<$imax && $isprereq==0} {incr i 1} {
+         set withmod [lindex $g_lmPrereq($prereqmod) $i]
+         set jmax [llength $withmod]
+         # check if modulename is part of a multiple-module-prereq
+         # registered for a loaded module. if so, check if another module
+         # from this multiple-module-prereq list is currently loaded
+         if {$jmax > 1} {
+            set isoptprereq 0
+            set otheroptisloaded 0
+            for {set j 0} {$j<$jmax && $otheroptisloaded==0} {incr j 1} {
+               set optmod [lindex $withmod $j]
+               if {[string first "$optmod/" "$modulename/"] == 0} {
+                  set isoptprereq 1
+               } else {
+                  for {set k 0} {$k<$kmax && $otheroptisloaded==0} \
+                     {incr k 1} {
+                     set loadedmod [lindex $lmlist $k]
+                     if {[string first "$optmod/" "$loadedmod/"] == 0} {
+                        set otheroptisloaded 1
+                     }
+                  }
+               }
+            }
+            if {$isoptprereq==1 && $otheroptisloaded==0} {
+               set isprereq 1
+               lappend dep_list $prereqmod
+            }
+         # check if module is registered as a prereq for a loaded module
+         } elseif {[string first "$withmod/" "$modulename/"] == 0} {
+            set isprereq 1
+            lappend dep_list $prereqmod
+         }
+      }
+   }
+
+   return $dep_list
+}
+
+# Reload all modules that have declared a prereq on modulename
+# as they may take benefit from their prereq availability if it
+# is newly loaded or unavailability if it is newly unloaded.
+proc reloadDepLoadedModuleList {modulename} {
+   global env g_def_separator
+
+   # build list of loaded module declaring a prereq onto module
+   set prereq_list [getDepLoadedModuleList $modulename]
+   if {[llength $prereq_list] > 0} {
+      # build ordered list of modules that need to be
+      # reloaded to satisfy the prereq they have registered
+      set uplist {}
+      foreach lmmod [split $env(LOADEDMODULES) $g_def_separator] {
+         if {[lsearch -exact $prereq_list $lmmod] != -1} {
+            lappend uplist $lmmod
+         }
+      }
+
+      # unload module list in reverse loaded order
+      foreach upmod [lreverse $uplist] {
+         cmdModuleUnload $upmod
+      }
+      # then load module list again
+      foreach upmod $uplist {
+         cmdModuleLoad $upmod
+      }
+   }
+}
+
 # get collection target currently set if any.
 # a target is a domain on which a collection is only valid.
 # when a target is set, only the collections made for that target
@@ -4033,6 +4187,7 @@ proc cmdModuleSearch {{mod {}} {search {}}} {
 
 proc cmdModuleSwitch {old {new {}}} {
    global g_loadedModulesGeneric g_loadedModules
+   global env g_def_separator g_orig_load_control
 
    if {$new eq ""} {
       set new $old
@@ -4047,8 +4202,44 @@ proc cmdModuleSwitch {old {new {}}} {
 
    reportDebug "cmdModuleSwitch: new=\"$new\" old=\"$old\""
 
-   cmdModuleUnload $old
-   cmdModuleLoad $new
+   if {$g_orig_load_control == 0} {
+      set oldfile [getPathToModule $old]
+      if {$oldfile != ""} {
+         set oldModule [lindex $oldfile 1]
+
+         # build list of loaded module declaring
+         # a prereq onto old module
+         set prereq_list [getDepLoadedModuleList $oldModule]
+
+         # build ordered list of modules that need to be reloaded
+         # to satisfy the prereq they have registered
+         set uplist {}
+         if {[info exists env(LOADEDMODULES)]} {
+            foreach mod [split $env(LOADEDMODULES) $g_def_separator] {
+               if {$mod != $oldModule && [lsearch -exact\
+                  $prereq_list $mod] != -1} {
+                  lappend uplist $mod
+               }
+            }
+         }
+
+         # unload every module having a prereq onto old
+         foreach mod [lreverse $uplist] {
+            cmdModuleUnload $mod
+         }
+         cmdModuleUnload $old
+         cmdModuleLoad $new
+         # load again every module with prereq onto old after
+         # load of new. these module loads may fail if prereq
+         # are not satisfied anymore
+         foreach mod $uplist {
+            cmdModuleLoad $mod
+         }
+      }
+   } else {
+      cmdModuleUnload $old
+      cmdModuleLoad $new
+   }
 }
 
 proc cmdModuleSave {{coll {}}} {
@@ -4324,6 +4515,7 @@ proc cmdModuleLoad {args} {
    global ModulesCurrentModulefile
    global g_def_separator_lvl2 g_lmConflict ModulesCurrentConflict
    global env g_orig_load_control
+   global g_def_separator_lvl3 g_lmPrereq ModulesCurrentPrereq
 
    reportDebug "cmdModuleLoad: loading $args"
 
@@ -4420,6 +4612,28 @@ proc cmdModuleLoad {args} {
                         set g_lmConflict($currentModule) \
                            $ModulesCurrentConflict($currentModule)
                      }
+
+                     # declare the prereq of this module
+                     if {[info exists ModulesCurrentPrereq($currentModule)]} {
+                        set lmprereq "$currentModule"
+                        foreach prereq $ModulesCurrentPrereq($currentModule) {
+                           append lmprereq $g_def_separator_lvl2[join \
+                              $prereq $g_def_separator_lvl3]
+                        }
+                        append-path _LMPREREQ_ $lmprereq
+                        set g_lmPrereq($currentModule) \
+                           $ModulesCurrentPrereq($currentModule)
+                     }
+
+                     # Reload all modules declaring a prereq on
+                     # currentModule. Only modules with optional
+                     # prereq are concerned, elsewhere currentModule
+                     # should have been loaded already.
+                     # Unlike cmdModuleSwitch, unload of the modules
+                     # declaring a prereq is performed after their
+                     # prereq-module load, to avoid reloading modules
+                     # whereas prereq-module fails to load.
+                     reloadDepLoadedModuleList $currentModule
                   }
                }
                popSettings
@@ -4437,6 +4651,7 @@ proc cmdModuleUnload {args} {
    global g_loadedModules g_loadedModulesGeneric
    global ModulesCurrentModulefile g_def_separator
    global g_orig_load_control g_def_separator_lvl2 g_lmConflict
+   global g_def_separator_lvl3 g_lmPrereq
 
    reportDebug "cmdModuleUnload: unloading $args"
 
@@ -4451,35 +4666,72 @@ proc cmdModuleUnload {args} {
             if {[info exists g_loadedModules($currentModule)]} {
                pushSpecifiedName $mod
                pushModuleName $currentModule
-               pushSettings
 
-               if {[execute-modulefile $modfile]} {
-                  restoreSettings
+               if {$g_orig_load_control == 0} {
+                  # check if any loaded module has declared a prereq
+                  set prereq_list [getActiveDepLoadedModuleList \
+                     $currentModule]
                } else {
-                  unload-path LOADEDMODULES $currentModule\
-                     $g_def_separator
-                  unload-path _LMFILES_ $modfile $g_def_separator
-                  unset g_loadedModules($currentModule)
-
-                  if {[info exists g_loadedModulesGeneric([file dirname\
-                     $currentModule])]} {
-                     unset g_loadedModulesGeneric([file dirname\
-                        $currentModule])
-                  }
-
-                  if {$g_orig_load_control == 0} {
-                     # unset conflict declared for this module
-                     if {[info exists g_lmConflict($currentModule)]} {
-                        unload-path _LMCONFLICT_ \
-                           "$currentModule$g_def_separator_lvl2[join \
-                           $g_lmConflict($currentModule) \
-                           $g_def_separator_lvl2]" $g_def_separator
-                        unset g_lmConflict($currentModule)
-                     }
-                  }
+                  set prereq_list {}
                }
 
-               popSettings
+               if {[llength $prereq_list] > 0} {
+                  # report an error instead of unloading module
+                  # if a prereq has been detected
+                  reportError "WARNING: $currentModule cannot be unloaded\
+                     due to a prereq.\nHINT: Might try \"module unload\
+                     [join $prereq_list]\" first."
+               } else {
+                  pushSettings
+                  if {[execute-modulefile $modfile]} {
+                     restoreSettings
+                  } else {
+                     unload-path LOADEDMODULES $currentModule\
+                        $g_def_separator
+                     unload-path _LMFILES_ $modfile $g_def_separator
+                     unset g_loadedModules($currentModule)
+
+                     if {[info exists g_loadedModulesGeneric([file dirname\
+                        $currentModule])]} {
+                        unset g_loadedModulesGeneric([file dirname\
+                           $currentModule])
+                     }
+
+                     if {$g_orig_load_control == 0} {
+                        # unset conflict declared for this module
+                        if {[info exists g_lmConflict($currentModule)]} {
+                           unload-path _LMCONFLICT_ \
+                              "$currentModule$g_def_separator_lvl2[join \
+                              $g_lmConflict($currentModule) \
+                              $g_def_separator_lvl2]" $g_def_separator
+                           unset g_lmConflict($currentModule)
+                        }
+
+                        # unset prereq declared for this module
+                        if {[info exists g_lmPrereq($currentModule)]} {
+                           set lmprereq "$currentModule"
+                           foreach prereq $g_lmPrereq($currentModule) {
+                              append lmprereq $g_def_separator_lvl2[join \
+                                 $prereq $g_def_separator_lvl3]
+                           }
+                           unload-path _LMPREREQ_ $lmprereq $g_def_separator
+                           unset g_lmPrereq($currentModule)
+                        }
+
+                        # Reload all modules declaring a prereq on
+                        # currentModule. Only modules with optional
+                        # prereq are concerned, elsewhere currentModule
+                        # would not have been unloaded.
+                        # Unlike cmdModuleSwitch, unload of the modules
+                        # declaring a prereq is performed after their
+                        # prereq-module unload, to avoid reloading modules
+                        # whereas prereq-module fails to unload.
+                        reloadDepLoadedModuleList $currentModule
+                     }
+                  }
+                  popSettings
+               }
+
                popModuleName
                popSpecifiedName
             }
@@ -4504,6 +4756,17 @@ proc cmdModuleUnload {args} {
                      "$mod$g_def_separator_lvl2[join $g_lmConflict($mod) \
                      $g_def_separator_lvl2]" $g_def_separator
                   unset g_lmConflict($mod)
+               }
+
+               # unset prereq declared for this module
+               if {[info exists g_lmPrereq($mod)]} {
+                  set lmprereq "$mod"
+                  foreach prereq $g_lmPrereq($mod) {
+                     append lmprereq $g_def_separator_lvl2[join \
+                        $prereq $g_def_separator_lvl3]
+                  }
+                  unload-path _LMPREREQ_ $lmprereq $g_def_separator
+                  unset g_lmPrereq($mod)
                }
             }
          }
