@@ -89,6 +89,10 @@ if {[info exists env(MODULECONTACT)]} {
 # (original conflict and prereq management)
 set g_orig_load_control 1
 
+# Set to 1 to automatically try to resolve modulefile dependencies
+# This behavior requires g_orig_load_control to be disabled.
+set g_auto_resolve_dep 0
+
 # Set some directories to ignore when looking for modules.
 set ignoreDir(CVS) 1
 set ignoreDir(RCS) 1
@@ -952,6 +956,8 @@ proc module-alias {args} {
 }
 
 proc module {command args} {
+   global g_auto_resolve_dep
+
    set mode [currentMode]
 
    # guess if called from top level
@@ -969,7 +975,11 @@ proc module {command args} {
          if {[llength $args] > 0} {
             pushCommandName "load"
             if {$topcall || $mode eq "load"} {
-               eval cmdModuleLoad $args
+               if {$g_auto_resolve_dep == 0} {
+                  eval cmdModuleLoad $args
+               } else {
+                  eval cmdModuleLoad --stick $args
+               }
             }\
             elseif {$mode eq "unload"} {
                # on unload mode, unload mods in reverse order
@@ -1822,7 +1832,7 @@ proc conflict {args} {
 }
 
 proc prereq {args} {
-   global ModulesCurrentPrereq g_orig_load_control
+   global ModulesCurrentPrereq g_orig_load_control g_auto_resolve_dep
 
    set mode [currentMode]
    set currentModule [currentModuleName]
@@ -1838,6 +1848,21 @@ proc prereq {args} {
             || [lsearch -exact $ModulesCurrentPrereq($currentModule) \
             $args] == -1} {
             lappend ModulesCurrentPrereq($currentModule) $args
+         }
+      }
+
+      # if dependency resolving is enabled try to load prereq
+      if {$g_auto_resolve_dep!=0 && ![is-loaded $args]} {
+         set imax [llength $args]
+         set prereqloaded 0
+         # if prereq list specified, try to load first then
+         # try next if load of first module not successful
+         for {set i 0} {$i<$imax && $prereqloaded==0} {incr i 1} {
+            set arg [lindex $args $i]
+            cmdModuleLoad $arg
+            if {[is-loaded $arg]} {
+               set prereqloaded 1
+            }
          }
       }
 
@@ -2793,7 +2818,7 @@ proc cacheCurrentModules {} {
    global g_loadedModules g_loadedModulesGeneric
    global g_orig_load_control g_def_separator_lvl2 g_lmConflict
    global env g_def_separator
-   global g_def_separator_lvl3 g_lmPrereq
+   global g_def_separator_lvl3 g_lmPrereq g_auto_resolve_dep g_lmSticky
 
    reportDebug "cacheCurrentModules"
 
@@ -2829,6 +2854,15 @@ proc cacheCurrentModules {} {
                   lappend lmprereq [split $prereq $g_def_separator_lvl3]
                }
                set g_lmPrereq([lindex $modlist 0]) $lmprereq
+            }
+         }
+      }
+
+      if {$g_auto_resolve_dep != 0} {
+         # cache declared stickyness of loaded modules
+         if {[info exists env(_LMSTICKY_)]} {
+            foreach modsticky [split $env(_LMSTICKY_) $g_def_separator] {
+               set g_lmSticky($modsticky) 1
             }
          }
       }
@@ -3672,11 +3706,25 @@ proc getMovementBetweenList {from to} {
 # at if no module path is set
 proc getSimplifiedLoadedModuleList {{helper_raw_list {}}\
    {helper_list {}}} {
+   global env g_def_separator g_auto_resolve_dep
+
    reportDebug "getSimplifiedLoadedModuleList"
+
+   if {$g_auto_resolve_dep==0} {
+      set loadedmodules [getLoadedModuleList]
+   } elseif {$g_auto_resolve_dep!=0 && [info exists env(_LMSTICKY_)]} {
+      # only save sticky loaded modules when dependency
+      # resolving is enabled since loading these modules
+      # when restoring collection will automatically load
+      # the other modules (which are dependencies)
+      set loadedmodules [split $env(_LMSTICKY_) $g_def_separator]
+   } else {
+      set loadedmodules {}
+   }
 
    set curr_mod_list {}
    set modpathlist [getModulePathList]
-   foreach mod [getLoadedModuleList] {
+   foreach mod $loadedmodules {
       if {[string length $mod] > 0} {
          set modparent [file dirname $mod]
          if {$modparent eq "."} {
@@ -3816,7 +3864,7 @@ proc getActiveDepLoadedModuleList {modulename} {
 # as they may take benefit from their prereq availability if it
 # is newly loaded or unavailability if it is newly unloaded.
 proc reloadDepLoadedModuleList {modulename} {
-   global env g_def_separator
+   global env g_def_separator g_auto_resolve_dep
 
    # build list of loaded module declaring a prereq onto module
    set prereq_list [getDepLoadedModuleList $modulename]
@@ -3824,9 +3872,21 @@ proc reloadDepLoadedModuleList {modulename} {
       # build ordered list of modules that need to be
       # reloaded to satisfy the prereq they have registered
       set uplist {}
-      foreach lmmod [split $env(LOADEDMODULES) $g_def_separator] {
-         if {[lsearch -exact $prereq_list $lmmod] != -1} {
-            lappend uplist $lmmod
+
+      if {$g_auto_resolve_dep==0 && [info exists env(LOADEDMODULES)]} {
+         set loadedmodules $env(LOADEDMODULES)
+      } elseif {$g_auto_resolve_dep!=0 && [info exists env(_LMSTICKY_)]} {
+         # only reload sticky loaded modules when dependency
+         # resolving is enabled since unloading and loading
+         # these modules will automatically unload and load
+         # other loaded modules (which are dependencies)
+         set loadedmodules $env(_LMSTICKY_)
+      }
+      if {[info exists loadedmodules]} {
+         foreach lmmod [split $loadedmodules $g_def_separator] {
+            if {[lsearch -exact $prereq_list $lmmod] != -1} {
+               lappend uplist $lmmod
+            }
          }
       }
 
@@ -3835,8 +3895,14 @@ proc reloadDepLoadedModuleList {modulename} {
          cmdModuleUnload $upmod
       }
       # then load module list again
-      foreach upmod $uplist {
-         cmdModuleLoad $upmod
+      if {$g_auto_resolve_dep==0} {
+         foreach upmod $uplist {
+            cmdModuleLoad $upmod
+         }
+      } else {
+         foreach upmod $uplist {
+            cmdModuleLoad --stick $upmod
+         }
       }
    }
 }
@@ -4187,7 +4253,7 @@ proc cmdModuleSearch {{mod {}} {search {}}} {
 
 proc cmdModuleSwitch {old {new {}}} {
    global g_loadedModulesGeneric g_loadedModules
-   global env g_def_separator g_orig_load_control
+   global env g_def_separator g_orig_load_control g_auto_resolve_dep
 
    if {$new eq ""} {
       set new $old
@@ -4214,8 +4280,20 @@ proc cmdModuleSwitch {old {new {}}} {
          # build ordered list of modules that need to be reloaded
          # to satisfy the prereq they have registered
          set uplist {}
-         if {[info exists env(LOADEDMODULES)]} {
-            foreach mod [split $env(LOADEDMODULES) $g_def_separator] {
+
+         if {$g_auto_resolve_dep==0 \
+            && [info exists env(LOADEDMODULES)]} {
+            set loadedmodules $env(LOADEDMODULES)
+         } elseif {$g_auto_resolve_dep!=0 \
+            && [info exists env(_LMSTICKY_)]} {
+            # only reload sticky loaded modules when dependency
+            # resolving is enabled since unloading and loading
+            # these modules will automatically unload and load
+            # other loaded modules (which are dependencies)
+            set loadedmodules $env(_LMSTICKY_)
+         }
+         if {[info exists loadedmodules]} {
+            foreach mod [split $loadedmodules $g_def_separator] {
                if {$mod != $oldModule && [lsearch -exact\
                   $prereq_list $mod] != -1} {
                   lappend uplist $mod
@@ -4228,12 +4306,22 @@ proc cmdModuleSwitch {old {new {}}} {
             cmdModuleUnload $mod
          }
          cmdModuleUnload $old
-         cmdModuleLoad $new
-         # load again every module with prereq onto old after
-         # load of new. these module loads may fail if prereq
-         # are not satisfied anymore
-         foreach mod $uplist {
-            cmdModuleLoad $mod
+         if {$g_auto_resolve_dep == 0} {
+            cmdModuleLoad $new
+            # load again every module with prereq onto old after
+            # load of new. these module loads may fail if prereq
+            # are not satisfied anymore
+            foreach mod $uplist {
+               cmdModuleLoad $mod
+            }
+         } else {
+            cmdModuleLoad --stick $new
+            # load again every module with prereq onto old after
+            # load of new. these module loads may fail if prereq
+            # are not satisfied anymore
+            foreach mod $uplist {
+               cmdModuleLoad --stick $mod
+            }
          }
       }
    } else {
@@ -4280,6 +4368,8 @@ proc cmdModuleSave {{coll {}}} {
 }
 
 proc cmdModuleRestore {{coll {}}} {
+   global g_auto_resolve_dep
+
    # default collection used if no name provided
    if {$coll eq ""} {
       set coll "default"
@@ -4360,8 +4450,13 @@ proc cmdModuleRestore {{coll {}}} {
 
    # load modules
    if {[llength $mod_to_load] > 0} {
-      eval cmdModuleLoad $mod_to_load
+      if {$g_auto_resolve_dep == 0} {
+         eval cmdModuleLoad $mod_to_load
+      } else {
+         eval cmdModuleLoad --stick $mod_to_load
+      }
    }
+
 }
 
 proc cmdModuleSaverm {{coll {}}} {
@@ -4516,8 +4611,23 @@ proc cmdModuleLoad {args} {
    global g_def_separator_lvl2 g_lmConflict ModulesCurrentConflict
    global env g_orig_load_control
    global g_def_separator_lvl3 g_lmPrereq ModulesCurrentPrereq
+   global g_def_separator g_lmSticky g_auto_resolve_dep
 
-   reportDebug "cmdModuleLoad: loading $args"
+   if {$g_orig_load_control == 0 && $g_auto_resolve_dep != 0} {
+      # check if stickiness defined
+      set stickyarg [lsearch -exact $args "--stick"]
+      if {$stickyarg != -1} {
+         set sticky 1
+         set args [lreplace $args $stickyarg $stickyarg]
+      } else {
+         set sticky 0
+      }
+      set sticky_debug_msg " (sticky=$sticky)"
+   } else {
+      set sticky_debug_msg ""
+   }
+
+   reportDebug "cmdModuleLoad: loading $args$sticky_debug_msg"
 
    pushMode "load"
    foreach mod $args {
@@ -4625,6 +4735,14 @@ proc cmdModuleLoad {args} {
                            $ModulesCurrentPrereq($currentModule)
                      }
 
+                     # declare stickiness of this module, even if
+                     # not sticky to ensure this module will not be
+                     # reloaded by prereq-reloading mechanism
+                     if {$g_auto_resolve_dep != 0} {
+                        append-path _LMSTICKY_ $currentModule
+                        set g_lmSticky($currentModule) 1
+                     }
+
                      # Reload all modules declaring a prereq on
                      # currentModule. Only modules with optional
                      # prereq are concerned, elsewhere currentModule
@@ -4634,6 +4752,14 @@ proc cmdModuleLoad {args} {
                      # prereq-module load, to avoid reloading modules
                      # whereas prereq-module fails to load.
                      reloadDepLoadedModuleList $currentModule
+
+                     # unset stickyness if module is not sticky now
+                     # that prereq-reloading phase is finished
+                     if {$g_auto_resolve_dep != 0 && $sticky == 0} {
+                        unload-path _LMSTICKY_ $currentModule \
+                           $g_def_separator
+                        unset g_lmSticky($currentModule)
+                     }
                   }
                }
                popSettings
@@ -4651,7 +4777,8 @@ proc cmdModuleUnload {args} {
    global g_loadedModules g_loadedModulesGeneric
    global ModulesCurrentModulefile g_def_separator
    global g_orig_load_control g_def_separator_lvl2 g_lmConflict
-   global g_def_separator_lvl3 g_lmPrereq
+   global g_def_separator_lvl3 g_lmPrereq g_lmSticky
+   global env g_auto_resolve_dep
 
    reportDebug "cmdModuleUnload: unloading $args"
 
@@ -4709,6 +4836,7 @@ proc cmdModuleUnload {args} {
 
                         # unset prereq declared for this module
                         if {[info exists g_lmPrereq($currentModule)]} {
+                           set modprereq $g_lmPrereq($currentModule)
                            set lmprereq "$currentModule"
                            foreach prereq $g_lmPrereq($currentModule) {
                               append lmprereq $g_def_separator_lvl2[join \
@@ -4716,6 +4844,61 @@ proc cmdModuleUnload {args} {
                            }
                            unload-path _LMPREREQ_ $lmprereq $g_def_separator
                            unset g_lmPrereq($currentModule)
+                        }
+
+                        # when dependency resolving is enabled, build
+                        # ordered list of prereq modules that have been
+                        # loaded automatically and that can now be
+                        # unloaded automatically
+                        if {$g_auto_resolve_dep!=0 \
+                           && [info exists modprereq]} {
+                           set lmlist [array names g_loadedModules]
+                           set imax [llength $lmlist]
+                           set mod_to_unload {}
+                           foreach prereqlist $modprereq {
+                              foreach prereq $prereqlist {
+                                 set prereqchecked 0
+                                 for {set i 0} {$i<$imax \
+                                    && $prereqchecked==0} {incr i 1} {
+                                    set loadedmod [lindex $lmlist $i]
+                                    if {[string first "$prereq/" \
+                                       "$loadedmod/"] == 0} {
+                                       set lmdep [getActiveDepLoadedModuleList \
+                                          $loadedmod]
+                                       if {![info exists \
+                                          g_lmSticky($loadedmod)] \
+                                          && [llength $lmdep]==0} {
+                                          lappend mod_to_unload $loadedmod
+                                       }
+                                       set prereqchecked 1
+                                    }
+                                 }
+                              }
+                           }
+                           set unloadlist {}
+                           if {[info exists env(LOADEDMODULES)]} {
+                              foreach lmmod [split $env(LOADEDMODULES) \
+                                 $g_def_separator] {
+                                 if {[lsearch -exact $mod_to_unload \
+                                    $lmmod] != -1} {
+                                    lappend unloadlist $lmmod
+                                 }
+                              }
+                           }
+                           # unload automatically loaded dependencies
+                           if {[llength $unloadlist] > 0} {
+                              foreach unmod [lreverse $unloadlist] {
+                                 cmdModuleUnload $unmod
+                              }
+                           }
+                        }
+
+                        # unset stickiness declared for this module
+                        if {$g_auto_resolve_dep != 0 \
+                           && [info exists g_lmSticky($currentModule)]} {
+                           unload-path _LMSTICKY_ $currentModule \
+                              $g_def_separator
+                           unset g_lmSticky($currentModule)
                         }
 
                         # Reload all modules declaring a prereq on
@@ -4768,6 +4951,13 @@ proc cmdModuleUnload {args} {
                   unload-path _LMPREREQ_ $lmprereq $g_def_separator
                   unset g_lmPrereq($mod)
                }
+
+               # unset stickiness declared for this module
+               if {$g_auto_resolve_dep != 0 \
+                  && [info exists g_lmSticky($mod)]} {
+                  unload-path _LMSTICKY_ $mod $g_def_separator
+                  unset g_lmSticky($mod)
+               }
             }
          }
       } errMsg ]} {
@@ -4778,21 +4968,54 @@ proc cmdModuleUnload {args} {
 }
 
 proc cmdModulePurge {} {
+   global env g_def_separator g_debug g_auto_resolve_dep
+
    reportDebug "cmdModulePurge"
 
-   eval cmdModuleUnload [lreverse [getLoadedModuleList]]
+   if {$g_auto_resolve_dep==0} {
+      set loadedmodules [getLoadedModuleList]
+   } elseif {$g_auto_resolve_dep!=0 && [info exists env(_LMSTICKY_)]} {
+      # only purge sticky loaded modules when dependency
+      # resolving is enabled since unloading and loading
+      # these modules will automatically unload and load
+      # other loaded modules (which are dependencies)
+      set loadedmodules [split $env(_LMSTICKY_) $g_def_separator]
+   } else {
+      set loadedmodules {}
+   }
+
+   eval cmdModuleUnload [lreverse $loadedmodules]
 }
 
 proc cmdModuleReload {} {
+   global env g_def_separator g_auto_resolve_dep
+
    reportDebug "cmdModuleReload"
 
-   set list [getLoadedModuleList]
+   if {$g_auto_resolve_dep==0} {
+      set list [getLoadedModuleList]
+   } elseif {$g_auto_resolve_dep!=0 && [info exists env(_LMSTICKY_)]} {
+      # only reload sticky loaded modules when dependency
+      # resolving is enabled since unloading and loading
+      # these modules will automatically unload and load
+      # other loaded modules (which are dependencies)
+      set list [split $env(_LMSTICKY_) $g_def_separator]
+   } else {
+      set list {}
+   }
    set rlist [lreverse $list]
+
    foreach mod $rlist {
       cmdModuleUnload $mod
    }
-   foreach mod $list {
-      cmdModuleLoad $mod
+   if {$g_auto_resolve_dep == 0} {
+      foreach mod $list {
+         cmdModuleLoad $mod
+      }
+   } else {
+      foreach mod $list {
+         cmdModuleLoad --stick $mod
+      }
    }
 }
 
