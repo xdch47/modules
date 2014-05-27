@@ -33,7 +33,7 @@ echo "FATAL: module: Could not find tclsh in \$PATH or in standard directories" 
 #
 # Some Global Variables.....
 #
-set MODULES_CURRENT_VERSION 1.923
+set MODULES_CURRENT_VERSION 1.923.deps
 set MODULES_CURRENT_RELEASE_DATE "2017-07-20"
 set g_debug 0 ;# Set to 1 to enable debugging
 set error_count 0 ;# Start with 0 errors
@@ -87,11 +87,11 @@ if {[info exists env(MODULECONTACT)]} {
 
 # Set to 1 to preserve original load control behavior
 # (original conflict and prereq management)
-set g_orig_load_control 1
+set g_orig_load_control 0
 
 # Set to 1 to automatically try to resolve modulefile dependencies
 # This behavior requires g_orig_load_control to be disabled.
-set g_auto_resolve_dep 0
+set g_auto_resolve_dep 1
 
 # Set some directories to ignore when looking for modules.
 set ignoreDir(CVS) 1
