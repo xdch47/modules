@@ -1,5 +1,9 @@
 language: generic
 
+branches:
+  except:
+    - deps
+
 dist: trusty
 sudo: false
 
