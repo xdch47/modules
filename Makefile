@@ -241,6 +241,10 @@ ifeq ($(compatversion),y)
 	cp $(COMPAT_DIR)/NEWS $(DESTDIR)$(docdir)/NEWS-compat
 endif
 endif
+ifeq ($(vimplugin),y)
+	mkdir -p $(DESTDIR)$(vimplugindir)
+	cp -r contrib/vim/* $(DESTDIR)$(vimplugindir)/
+endif
 	$(MAKE) -C init install DESTDIR=$(DESTDIR)
 ifeq ($(builddoc),y)
 	$(MAKE) -C doc install DESTDIR=$(DESTDIR)
@@ -263,6 +267,11 @@ endif
 	rm -f $(DESTDIR)$(bindir)/add.modules
 	rm -f $(DESTDIR)$(bindir)/modulecmd
 	rm -f $(DESTDIR)$(bindir)/mkroot
+ifeq ($(vimplugin),y)
+	rm -f $(patsubst contrib/vim/%,$(DESTDIR)$(vimplugindir)/%,$(wildcard contrib/vim/*/*))
+	-rmdir $(DESTDIR)$(vimplugindir)/*
+	-rmdir -p $(DESTDIR)$(vimplugindir)
+endif
 ifeq ($(docinstall),y)
 	rm -f $(addprefix $(DESTDIR)$(docdir)/,ChangeLog README COPYING.GPLv2)
 ifeq ($(compatversion),y)
